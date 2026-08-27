@@ -189,6 +189,268 @@ def build_block(rows,team_id):
         d["card_o"+str(line).replace(".","_")]=rate([x>line for x in card_tot])
     return d
 
+
+def league_tier(ccode,name):
+    s=str(name or "").lower()
+    cc=str(ccode or "").upper()
+
+    if any(x in s for x in (
+        "cup","copa","pokal","coupe","coppa","cupen","beker","trophy",
+        "champions league","europa league","conference league","qualif","friendly",
+        "club world","libertadores","sudamericana"
+    )):
+        return None
+
+    # Country-specific domestic pyramids.
+    rules={
+      "SWE":[
+        (1,("allsvenskan",)),
+        (2,("superettan",)),
+        (3,("ettan","division 1")),
+        (4,("division 2",)),
+        (5,("division 3",)),
+      ],
+      "ENG":[
+        (1,("premier league",)),
+        (2,("championship",)),
+        (3,("league one",)),
+        (4,("league two",)),
+        (5,("national league",)),
+        (6,("national league north","national league south")),
+      ],
+      "GER":[
+        (1,("bundesliga",)),
+        (2,("2. bundesliga",)),
+        (3,("3. liga",)),
+        (4,("regionalliga",)),
+        (5,("oberliga",)),
+      ],
+      "ESP":[
+        (1,("laliga","la liga","primera división","primera division")),
+        (2,("segunda división","segunda division","laliga2")),
+        (3,("primera federación","primera federacion")),
+        (4,("segunda federación","segunda federacion")),
+        (5,("tercera federación","tercera federacion")),
+      ],
+      "ITA":[
+        (1,("serie a",)),
+        (2,("serie b",)),
+        (3,("serie c",)),
+        (4,("serie d",)),
+      ],
+      "FRA":[
+        (1,("ligue 1",)),
+        (2,("ligue 2",)),
+        (3,("national 1","national",)),
+        (4,("national 2",)),
+        (5,("national 3",)),
+      ],
+      "NED":[
+        (1,("eredivisie",)),
+        (2,("eerste divisie",)),
+        (3,("tweede divisie",)),
+        (4,("derde divisie",)),
+      ],
+      "POR":[
+        (1,("primeira liga","liga portugal")),
+        (2,("liga portugal 2","segunda liga")),
+        (3,("liga 3",)),
+      ],
+      "TUR":[
+        (1,("süper lig","super lig")),
+        (2,("1. lig",)),
+        (3,("2. lig",)),
+        (4,("3. lig",)),
+      ],
+      "NOR":[
+        (1,("eliteserien",)),
+        (2,("obos-ligaen","1. divisjon")),
+        (3,("2. divisjon",)),
+        (4,("3. divisjon",)),
+      ],
+      "DEN":[
+        (1,("superliga",)),
+        (2,("1st division","1. division")),
+        (3,("2nd division","2. division")),
+        (4,("3rd division","3. division")),
+      ],
+      "SCO":[
+        (1,("premiership",)),
+        (2,("championship",)),
+        (3,("league one",)),
+        (4,("league two",)),
+      ],
+      "BEL":[
+        (1,("pro league","first division a")),
+        (2,("challenger pro league","first division b")),
+      ],
+      "AUT":[
+        (1,("bundesliga",)),
+        (2,("2. liga",)),
+        (3,("regionalliga",)),
+      ],
+      "SUI":[
+        (1,("super league",)),
+        (2,("challenge league",)),
+        (3,("promotion league",)),
+      ],
+      "POL":[
+        (1,("ekstraklasa",)),
+        (2,("i liga","1 liga")),
+        (3,("ii liga","2 liga")),
+      ],
+      "CZE":[
+        (1,("first league","1. liga")),
+        (2,("national football league","2. liga")),
+      ],
+      "GRE":[
+        (1,("super league",)),
+        (2,("super league 2",)),
+      ],
+      "ROU":[
+        (1,("liga i","liga 1")),
+        (2,("liga ii","liga 2")),
+      ],
+      "CRO":[
+        (1,("hnl","1. hnl")),
+        (2,("prva nl","2. hnl")),
+      ],
+      "SRB":[
+        (1,("super liga",)),
+        (2,("prva liga",)),
+      ],
+      "BRA":[
+        (1,("série a","serie a")),
+        (2,("série b","serie b")),
+        (3,("série c","serie c")),
+        (4,("série d","serie d")),
+      ],
+      "ARG":[
+        (1,("primera división","primera division","liga profesional")),
+        (2,("primera nacional",)),
+        (3,("primera b metropolitana",)),
+      ],
+      "USA":[
+        (1,("mls","major league soccer")),
+        (2,("usl championship",)),
+        (3,("usl league one",)),
+      ],
+      "MEX":[
+        (1,("liga mx",)),
+        (2,("liga de expansión","liga de expansion")),
+      ],
+      "JPN":[
+        (1,("j1 league",)),
+        (2,("j2 league",)),
+        (3,("j3 league",)),
+      ],
+      "KOR":[
+        (1,("k league 1","k-league 1")),
+        (2,("k league 2","k-league 2")),
+      ],
+      "AUS":[
+        (1,("a-league",)),
+      ],
+    }
+
+    for tier,names in rules.get(cc,[]):
+        if any(x in s for x in names):
+            # Bundesliga special case: don't mistake 2. Bundesliga for tier 1.
+            if cc=="GER" and tier==1 and "2. bundesliga" in s:
+                continue
+            return tier
+
+    # Generic fallbacks, conservative.
+    generic_top=("premier division","premier league","super league","superliga","premiership")
+    if any(x in s for x in generic_top):return 1
+    if "division 1" in s or "first division" in s:return 2
+    if "division 2" in s or "second division" in s:return 3
+    if "division 3" in s or "third division" in s:return 4
+    return None
+
+def dominant_league(rows):
+    # Cups/friendlies must never become the team's league identity.
+    vals=[]
+    for r in rows:
+        lg=r.get("league")
+        cc=r.get("ccode")
+        tier=league_tier(cc,lg)
+        if tier is None:
+            continue
+        vals.append((str(cc or ""),str(lg or ""),tier))
+    if not vals:
+        return {"ccode":None,"league":None,"tier":None,"matches":0,"share":0.0}
+    counts={}
+    for v in vals:counts[v]=counts.get(v,0)+1
+    (cc,lg,tier),n=max(counts.items(),key=lambda kv:kv[1])
+    return {"ccode":cc,"league":lg,"tier":tier,"matches":n,"share":n/max(1,len(vals))}
+
+def base_power_from_tier(tier):
+    # Wide enough separation that cross-tier cup games materially change expectation.
+    return {1:90,2:76,3:64,4:54,5:47,6:42}.get(tier,68)
+
+def team_result_metrics(rows,tid):
+    pts=[];gd=[];gf=[];ga=[]
+    for r in rows[-20:]:
+        home=str(r.get("home_id"))==str(tid)
+        a=int(r.get("hg",0)) if home else int(r.get("ag",0))
+        b=int(r.get("ag",0)) if home else int(r.get("hg",0))
+        gf.append(a);ga.append(b);gd.append(a-b)
+        pts.append(3 if a>b else (1 if a==b else 0))
+    if not pts:return {"ppg":None,"gd":None,"gf":None,"ga":None}
+    return {
+        "ppg":sum(pts)/len(pts),
+        "gd":sum(gd)/len(gd),
+        "gf":sum(gf)/len(gf),
+        "ga":sum(ga)/len(ga),
+    }
+
+def build_strength_meta(by):
+    meta={}
+    for tid,rows in by.items():
+        rows=sorted(rows,key=lambda x:x.get("date",""))
+        dom=dominant_league(rows[-30:])
+        perf=team_result_metrics(rows,tid)
+        base=base_power_from_tier(dom["tier"])
+        if perf["ppg"] is None:
+            power=base
+        else:
+            power=base+(perf["ppg"]-1.35)*6.0+float(perf["gd"] or 0)*4.0
+        meta[tid]={
+            **dom,**perf,
+            "base_power":max(35,min(98,power)),
+            "power":max(35,min(98,power)),
+        }
+
+    # Opponent-quality adjustment. One pass is enough and avoids recursive instability.
+    for tid,rows in by.items():
+        vals=[]
+        for r in sorted(rows,key=lambda x:x.get("date",""))[-16:]:
+            home=str(r.get("home_id"))==str(tid)
+            oid=str(r.get("away_id") if home else r.get("home_id"))
+            opp=meta.get(oid)
+            if not opp:continue
+            a=int(r.get("hg",0)) if home else int(r.get("ag",0))
+            b=int(r.get("ag",0)) if home else int(r.get("hg",0))
+            pts=3 if a>b else (1 if a==b else 0)
+            val=50+(pts-1.35)*9+(a-b)*4+(float(opp.get("base_power",68))-68)*.28
+            vals.append(max(0,min(100,val)))
+        if vals:
+            oq=sum(vals)/len(vals)
+            meta[tid]["opponent_form"]=oq
+            meta[tid]["power"]=max(35,min(98,.78*meta[tid]["base_power"]+.22*oq))
+        else:
+            meta[tid]["opponent_form"]=None
+
+        # Context confidence: tier known + dominant-league share + enough matches.
+        n=len(by.get(tid,[]))
+        known=1.0 if meta[tid].get("tier") is not None else 0.0
+        share=float(meta[tid].get("share") or 0)
+        sample=min(1.0,n/12)
+        meta[tid]["context_confidence"]=round(100*(.55*known+.25*share+.20*sample),1)
+
+    return meta
+
 def build_profiles(matches):
     by={}
     names={}
@@ -198,19 +460,41 @@ def build_profiles(matches):
             if tid is None:continue
             by.setdefault(str(tid),[]).append(r)
             names[str(tid)]=r.get(side)
+
+    strength=build_strength_meta(by)
     teams={}
     for tid,rows in by.items():
         rows=sorted(rows,key=lambda x:x.get("date",""))
         home=[r for r in rows if str(r.get("home_id"))==tid][-12:]
         away=[r for r in rows if str(r.get("away_id"))==tid][-12:]
         allr=rows[-20:]
+        sm=strength.get(tid,{})
         teams[tid]={
             "name":names.get(tid),
             "all":build_block(allr,tid),
             "home":build_block(home,tid),
             "away":build_block(away,tid),
+            "context":{
+                "ccode":sm.get("ccode"),
+                "dominant_league":sm.get("league"),
+                "tier":sm.get("tier"),
+                "league_matches":sm.get("matches",0),
+                "league_share":sm.get("share",0),
+                "ppg":sm.get("ppg"),
+                "goal_diff":sm.get("gd"),
+                "gf":sm.get("gf"),
+                "ga":sm.get("ga"),
+                "base_power":sm.get("base_power",68),
+                "opponent_form":sm.get("opponent_form"),
+                "power":sm.get("power",68),
+                "context_confidence":sm.get("context_confidence",0),
+            }
         }
-    return {"generated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"teams":teams}
+    return {
+        "generated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "schema_version":21,
+        "teams":teams
+    }
 
 tz=datetime.timezone(datetime.timedelta(hours=3))
 today=datetime.datetime.now(datetime.timezone.utc).astimezone(tz).date()
