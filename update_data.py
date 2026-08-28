@@ -1,10 +1,13 @@
-import json, urllib.request, datetime, pathlib, time, re, math
+import json, urllib.request, datetime, pathlib, time, re, math, unicodedata
+from html.parser import HTMLParser
 
 OUT=pathlib.Path("data")
 OUT.mkdir(exist_ok=True)
 HISTORY=OUT/"history.json"
 PROFILES=OUT/"profiles.json"
-MAX_DETAIL_PER_RUN=220
+ODDS_TODAY=OUT/"odds_today.json"
+ODDS_HISTORY=OUT/"odds_history.json"
+MAX_DETAIL_PER_RUN=280
 
 def get_json(url,timeout=45):
     req=urllib.request.Request(url,headers={
@@ -389,6 +392,16 @@ def base_power_from_tier(tier):
     # Wide enough separation that cross-tier cup games materially change expectation.
     return {1:90,2:76,3:64,4:54,5:47,6:42}.get(tier,68)
 
+def tier_power_bounds(tier):
+    return {
+        1:(72,98),
+        2:(62,87),
+        3:(54,77),
+        4:(46,66),
+        5:(40,59),
+        6:(36,53),
+    }.get(tier,(35,98))
+
 def team_result_metrics(rows,tid):
     pts=[];gd=[];gf=[];ga=[]
     for r in rows[-20:]:
@@ -416,10 +429,12 @@ def build_strength_meta(by):
             power=base
         else:
             power=base+(perf["ppg"]-1.35)*6.0+float(perf["gd"] or 0)*4.0
+        lo,hi=tier_power_bounds(dom.get("tier"))
+        bounded=max(lo,min(hi,power))
         meta[tid]={
             **dom,**perf,
-            "base_power":max(35,min(98,power)),
-            "power":max(35,min(98,power)),
+            "base_power":bounded,
+            "power":bounded,
         }
 
     # Opponent-quality adjustment. One pass is enough and avoids recursive instability.
@@ -438,7 +453,8 @@ def build_strength_meta(by):
         if vals:
             oq=sum(vals)/len(vals)
             meta[tid]["opponent_form"]=oq
-            meta[tid]["power"]=max(35,min(98,.78*meta[tid]["base_power"]+.22*oq))
+            lo,hi=tier_power_bounds(meta[tid].get("tier"))
+            meta[tid]["power"]=max(lo,min(hi,.78*meta[tid]["base_power"]+.22*oq))
         else:
             meta[tid]["opponent_form"]=None
 
@@ -492,7 +508,7 @@ def build_profiles(matches):
         }
     return {
         "generated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "schema_version":21,
+        "schema_version":22,
         "teams":teams
     }
 
@@ -549,7 +565,7 @@ for r in hist:
 
 targets={}
 for tid,rows in team_hist.items():
-    for r in rows[-8:]:
+    for r in rows[-14:]:
         if not r.get("detail_ok"):
             targets[str(r["id"])]=r
 
@@ -576,3 +592,185 @@ PROFILES.write_text(
 )
 print("history.json",len(hist),"matches")
 print("profiles.json written")
+
+
+
+
+# ---------------- V22 PUBLIC TR-MARKET ODDS SNAPSHOTS ----------------
+# Public pages expose current Iddaa-style prices. We store the FIRST hourly observation
+# as opening and the latest observation as current. Site prediction percentages are ignored.
+from html.parser import HTMLParser
+import unicodedata
+
+ODDS_PAGES={
+    "MS1":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/mac-sonucu-ev-sahibi-kazanir",
+    "MSX":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/mac-sonucu-berabere-biter",
+    "KG Var":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/kg-var-analizi",
+    "KG Yok":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/kg-yok-analizi",
+    "1.5 Üst":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/mac-1-5-ust-biter",
+    "2.5 Üst":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/mac-2-5-ust-biter",
+    "2.5 Alt":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/mac-2-5-alt-biter",
+    "İY 0.5 Üst":"https://www.iddaaorantahmin.com/iddaa-oran-analiz/ilk-yari-ust-0-5",
+}
+
+class _Table(HTMLParser):
+    def __init__(self):super().__init__();self.rows=[];self.row=None;self.cell=None
+    def handle_starttag(self,tag,attrs):
+        if tag=='tr':self.row=[]
+        elif tag in ('td','th') and self.row is not None:self.cell=[]
+    def handle_data(self,data):
+        if self.cell is not None:self.cell.append(data)
+    def handle_endtag(self,tag):
+        if tag in ('td','th') and self.cell is not None and self.row is not None:
+            self.row.append(' '.join(' '.join(self.cell).split()));self.cell=None
+        elif tag=='tr' and self.row is not None:
+            if self.row:self.rows.append(self.row)
+            self.row=None
+
+def _norm(s):
+    s=unicodedata.normalize('NFKD',str(s or '')).encode('ascii','ignore').decode().lower()
+    return re.sub(r'[^a-z0-9]+',' ',s).strip()
+
+def _sim(a,b):
+    A=set(_norm(a).split());B=set(_norm(b).split())
+    return len(A&B)/max(1,len(A|B))
+
+def scrape_market(url,target_date):
+    req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,*/*'})
+    with urllib.request.urlopen(req,timeout=40) as r:html=r.read().decode('utf-8','ignore')
+    p=_Table();p.feed(html);out=[]
+    for cells in p.rows:
+        if len(cells)<5:continue
+        datecell=cells[0];match=cells[2];odd=cells[-1]
+        if target_date.isoformat() not in datecell or ' - ' not in match:continue
+        try:o=float(str(odd).replace(',','.'))
+        except:continue
+        home,away=match.split(' - ',1)
+        if 1.01<=o<=50:out.append({'home':home.strip(),'away':away.strip(),'odd':o})
+    return out
+
+def _odd_num(cell):
+    s=str(cell or '').replace(',','.')
+    nums=re.findall(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)',s)
+    if not nums:return None
+    try:
+        vals=[float(x) for x in nums]
+        vals=[x for x in vals if 1.01<=x<=50]
+        return vals[-1] if vals else None
+    except:return None
+
+def scrape_bulletin():
+    """One-page TR bulletin: MS 1-X-2, 2.5, 3.5, double chance and BTTS."""
+    url='https://www.iddaaorantahmin.com/iddaa-bulteni'
+    req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,*/*'})
+    with urllib.request.urlopen(req,timeout=45) as r:html=r.read().decode('utf-8','ignore')
+    p=_Table();p.feed(html);out=[]
+    for cells in p.rows:
+        if len(cells)<15:continue
+        # Typical columns: Lig,Saat,Kod,MBS,Maç,1,0,2,2.5A,2.5U,3.5A,3.5U,1X,12,X2,VAR,YOK,...
+        match_i=None
+        for i,cell in enumerate(cells):
+            if ' - ' in cell and i>=2:
+                match_i=i;break
+        if match_i is None or match_i+8>=len(cells):continue
+        match=cells[match_i]
+        try:home,away=match.split(' - ',1)
+        except:continue
+        vals=cells[match_i+1:]
+        mapping={}
+        names=['MS1','MSX','MS2','2.5 Alt','2.5 Üst','3.5 Alt','3.5 Üst','1X','12','X2','KG Var','KG Yok']
+        for name,cell in zip(names,vals[:len(names)]):
+            o=_odd_num(cell)
+            if o is not None:mapping[name]=o
+        if mapping:
+            out.append({'home':home.strip(),'away':away.strip(),'markets':mapping})
+    return out
+
+def collect_tr_odds(today_obj,target_date):
+    fixtures=[]
+    for lg in today_obj.get('leagues',[]):
+        for m in lg.get('matches',[]):
+            h=(m.get('home') or {}).get('name');a=(m.get('away') or {}).get('name')
+            if h and a:fixtures.append({'match_id':m.get('id'),'home':h,'away':a,'league':lg.get('name')})
+    collected={str(x['match_id']):dict(x,markets={}) for x in fixtures if x.get('match_id') is not None}
+
+    # Preferred source: full bulletin in one request.
+    used_bulletin=False
+    try:
+        rows=scrape_bulletin();used_bulletin=bool(rows)
+        for row in rows:
+            best=None;bestscore=0
+            for fx in fixtures:
+                score=(_sim(row['home'],fx['home'])+_sim(row['away'],fx['away']))/2
+                if score>bestscore:bestscore=score;best=fx
+            if best and bestscore>=.48 and best.get('match_id') is not None:
+                collected[str(best['match_id'])]['markets'].update(row.get('markets') or {})
+        print('bulletin odds rows',len(rows))
+    except Exception as e:
+        print('bulletin odds error',e)
+
+    # Fallback / extra market source. Never use the site's prediction percentage, only price.
+    if not used_bulletin:
+        for market,url in ODDS_PAGES.items():
+            try:rows=scrape_market(url,target_date)
+            except Exception as e:
+                print('odds scrape error',market,e);continue
+            for row in rows:
+                best=None;bestscore=0
+                for fx in fixtures:
+                    score=(_sim(row['home'],fx['home'])+_sim(row['away'],fx['away']))/2
+                    if score>bestscore:bestscore=score;best=fx
+                if best and bestscore>=.48 and best.get('match_id') is not None:
+                    collected[str(best['match_id'])]['markets'][market]=row['odd']
+            time.sleep(.15)
+    return [x for x in collected.values() if x['markets']]
+
+def update_odds_memory(today_obj,hist,target_date):
+    try:old=json.loads(ODDS_TODAY.read_text(encoding='utf-8')) if ODDS_TODAY.exists() else {}
+    except:old={}
+    oldmap={str(x.get('match_id')):x for x in old.get('matches',[]) if x.get('match_id') is not None}
+    fresh=collect_tr_odds(today_obj,target_date)
+    now=datetime.datetime.now(tz).isoformat();rows=[]
+    for x in fresh:
+        k=str(x['match_id']);prev=oldmap.get(k,{})
+        opening=dict(prev.get('opening') or {})
+        current=dict(prev.get('current') or {})
+        for m,o in x['markets'].items():
+            opening.setdefault(m,o);current[m]=o
+        rows.append({**{z:x.get(z) for z in ('match_id','home','away','league')},'opening':opening,'current':current,'opening_kind':'first_observed_snapshot','first_seen':prev.get('first_seen') or now,'updated_at':now})
+    ODDS_TODAY.write_text(json.dumps({'schema_version':22,'generated_at':now,'market':'TR','source':'public TR iddaa bulletin / odds pages','matches':rows},ensure_ascii=False),encoding='utf-8')
+
+    # Move finished snapshots into durable pattern history, attaching actual scores.
+    try:oh=json.loads(ODDS_HISTORY.read_text(encoding='utf-8')) if ODDS_HISTORY.exists() else {}
+    except:oh={}
+    hmap={str(x.get('match_id')):x for x in oh.get('matches',[]) if x.get('match_id') is not None}
+    finished={str(x.get('id')):x for x in hist if x.get('id') is not None}
+    for k,x in oldmap.items():
+        fr=finished.get(k)
+        if not fr or not (x.get('opening') or {}):continue
+        rec=dict(x);rec.update({'date':fr.get('date'),'hg':fr.get('hg'),'ag':fr.get('ag'),'first_half_goals':fr.get('first_half_goals')})
+        hmap[k]=rec
+    vals=list(hmap.values())[-50000:]
+    ODDS_HISTORY.write_text(json.dumps({'schema_version':22,'generated_at':now,'market':'TR','matches':vals},ensure_ascii=False),encoding='utf-8')
+    print('TR odds snapshots',len(rows),'pattern history',len(vals))
+
+# V22 odds-memory storage. This updater never invents prices.
+# When a TR-market odds collector writes matches here, first observed prices stay opening,
+# later snapshots become current, and finished rows can be retained in odds_history.json.
+def ensure_odds_store(path,kind):
+    if path.exists():
+        try:
+            obj=json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(obj,dict):
+                obj["schema_version"]=22;obj["generated_at"]=datetime.datetime.now(tz).isoformat()
+                path.write_text(json.dumps(obj,ensure_ascii=False),encoding="utf-8");return
+        except:pass
+    path.write_text(json.dumps({"schema_version":22,"generated_at":datetime.datetime.now(tz).isoformat(),"market":"TR","kind":kind,"matches":[]},ensure_ascii=False),encoding="utf-8")
+
+ensure_odds_store(ODDS_TODAY,"opening_current")
+ensure_odds_store(ODDS_HISTORY,"pattern_history")
+try:
+    update_odds_memory(today_obj,hist,today)
+except Exception as e:
+    print("odds memory update error",e)
+print("odds memory store ready (real prices only; empty if no TR odds feed)")
