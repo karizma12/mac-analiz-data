@@ -659,9 +659,8 @@ def _odd_num(cell):
         return vals[-1] if vals else None
     except:return None
 
-def scrape_bulletin():
-    """One-page TR bulletin: MS 1-X-2, 2.5, 3.5, double chance and BTTS."""
-    url='https://www.iddaaorantahmin.com/iddaa-bulteni'
+def scrape_bulletin_url(url):
+    """Parse a bulletin URL. Historical dated pages are treated as archived opening prices."""
     req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,*/*'})
     with urllib.request.urlopen(req,timeout=45) as r:html=r.read().decode('utf-8','ignore')
     p=_Table();p.feed(html);out=[]
@@ -685,6 +684,54 @@ def scrape_bulletin():
         if mapping:
             out.append({'home':home.strip(),'away':away.strip(),'markets':mapping})
     return out
+
+
+def scrape_bulletin():
+    return scrape_bulletin_url('https://www.iddaaorantahmin.com/iddaa-bulteni')
+
+def scrape_archive_day(d):
+    url=f"https://www.iddaaorantahmin.com/iddaa-bulteni/{d.strftime('%d/%m/%Y')}"
+    return scrape_bulletin_url(url)
+
+def _match_hist_for_archive(hist_by_date,d,home,away):
+    best=None;bestscore=0.0
+    for fr in hist_by_date.get(d.isoformat(),[]):
+        score=(_sim(home,fr.get('home'))+_sim(away,fr.get('away')))/2
+        if score>bestscore:bestscore=score;best=fr
+    return best if bestscore>=.50 else None
+
+def backfill_archive_odds(hist,hmap,target_date,days=120):
+    """Backfill exact archived opening odds for the previous 120 days. Persistent and restart-safe."""
+    hist_by_date={}
+    for fr in hist:
+        hist_by_date.setdefault(str(fr.get('date',''))[:10],[]).append(fr)
+    existing_dates=set(str(x.get('date',''))[:10] for x in hmap.values() if x.get('date'))
+    wanted=[target_date-datetime.timedelta(days=i) for i in range(1,days+1)]
+    missing=[d for d in wanted if d.isoformat() not in existing_dates]
+    # First V23 run fills the whole 120-day window; later runs normally fetch only the new missing day(s).
+    print('archive backfill missing days',len(missing))
+    for j,d in enumerate(reversed(missing),1):
+        try:
+            rows=scrape_archive_day(d)
+            added=0
+            for n,row in enumerate(rows):
+                markets=row.get('markets') or {}
+                if markets.get('KG Var') is None or markets.get('MS1') is None: continue
+                fr=_match_hist_for_archive(hist_by_date,d,row.get('home'),row.get('away'))
+                if not fr: continue
+                mid=str(fr.get('id') or f"archive:{d.isoformat()}:{_norm(row.get('home'))}:{_norm(row.get('away'))}")
+                rec={
+                    'match_id':fr.get('id') or mid,'home':fr.get('home') or row.get('home'),'away':fr.get('away') or row.get('away'),
+                    'league':fr.get('league'),'opening':markets,'current':markets,'opening_kind':'archive_opening',
+                    'first_seen':d.isoformat(),'updated_at':d.isoformat(),'date':d.isoformat(),
+                    'hg':fr.get('hg'),'ag':fr.get('ag'),'first_half_goals':fr.get('first_half_goals'),
+                }
+                hmap[mid]=rec;added+=1
+            print('archive',j,'/',len(missing),d,'rows',len(rows),'matched',added)
+            time.sleep(.10)
+        except Exception as e:
+            print('archive error',d,e)
+    return hmap
 
 def collect_tr_odds(today_obj,target_date):
     fixtures=[]
@@ -738,7 +785,7 @@ def update_odds_memory(today_obj,hist,target_date):
         for m,o in x['markets'].items():
             opening.setdefault(m,o);current[m]=o
         rows.append({**{z:x.get(z) for z in ('match_id','home','away','league')},'opening':opening,'current':current,'opening_kind':'first_observed_snapshot','first_seen':prev.get('first_seen') or now,'updated_at':now})
-    ODDS_TODAY.write_text(json.dumps({'schema_version':22,'generated_at':now,'market':'TR','source':'public TR iddaa bulletin / odds pages','matches':rows},ensure_ascii=False),encoding='utf-8')
+    ODDS_TODAY.write_text(json.dumps({'schema_version':23,'generated_at':now,'market':'TR','source':'public TR iddaa bulletin / odds pages','matches':rows},ensure_ascii=False),encoding='utf-8')
 
     # Move finished snapshots into durable pattern history, attaching actual scores.
     try:oh=json.loads(ODDS_HISTORY.read_text(encoding='utf-8')) if ODDS_HISTORY.exists() else {}
@@ -750,9 +797,13 @@ def update_odds_memory(today_obj,hist,target_date):
         if not fr or not (x.get('opening') or {}):continue
         rec=dict(x);rec.update({'date':fr.get('date'),'hg':fr.get('hg'),'ag':fr.get('ag'),'first_half_goals':fr.get('first_half_goals')})
         hmap[k]=rec
-    vals=list(hmap.values())[-50000:]
-    ODDS_HISTORY.write_text(json.dumps({'schema_version':22,'generated_at':now,'market':'TR','matches':vals},ensure_ascii=False),encoding='utf-8')
-    print('TR odds snapshots',len(rows),'pattern history',len(vals))
+    # Historical archive: last 120 days, exact opening odds + actual final scores.
+    hmap=backfill_archive_odds(hist,hmap,target_date,120)
+    cutoff=(target_date-datetime.timedelta(days=125)).isoformat()
+    vals=[x for x in hmap.values() if str(x.get('date') or x.get('first_seen') or '')[:10]>=cutoff]
+    vals.sort(key=lambda x:(str(x.get('date','')),str(x.get('match_id',''))))
+    ODDS_HISTORY.write_text(json.dumps({'schema_version':23,'generated_at':now,'market':'TR','window_days':120,'signature':'EXACT_KG_VAR_PLUS_MS1','matches':vals},ensure_ascii=False),encoding='utf-8')
+    print('TR odds snapshots',len(rows),'exact 120d pattern history',len(vals))
 
 # V22 odds-memory storage. This updater never invents prices.
 # When a TR-market odds collector writes matches here, first observed prices stay opening,
@@ -762,10 +813,10 @@ def ensure_odds_store(path,kind):
         try:
             obj=json.loads(path.read_text(encoding="utf-8"))
             if isinstance(obj,dict):
-                obj["schema_version"]=22;obj["generated_at"]=datetime.datetime.now(tz).isoformat()
+                obj["schema_version"]=23;obj["generated_at"]=datetime.datetime.now(tz).isoformat()
                 path.write_text(json.dumps(obj,ensure_ascii=False),encoding="utf-8");return
         except:pass
-    path.write_text(json.dumps({"schema_version":22,"generated_at":datetime.datetime.now(tz).isoformat(),"market":"TR","kind":kind,"matches":[]},ensure_ascii=False),encoding="utf-8")
+    path.write_text(json.dumps({"schema_version":23,"generated_at":datetime.datetime.now(tz).isoformat(),"market":"TR","kind":kind,"matches":[]},ensure_ascii=False),encoding="utf-8")
 
 ensure_odds_store(ODDS_TODAY,"opening_current")
 ensure_odds_store(ODDS_HISTORY,"pattern_history")
