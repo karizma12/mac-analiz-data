@@ -127,22 +127,27 @@ def detail_enrich(match):
     if hxg is not None and axg is not None:
         match["home_xg"]=hxg;match["away_xg"]=axg
 
-    # First-half goal presence from event minutes.
+    # First-half score + goal presence from event minutes.
     try:
         events=((detail.get("header") or {}).get("events") or [])
-        first_half_goal=False
-        known=False
+        first_half_goal=False; known=False; hth=0; hta=0; side_known=False
         for ev in events:
             if str(ev.get("type","")).lower()!="goal":continue
             ts=str(ev.get("timeStr") or "")
             mm=re.search(r"(\d+)",ts)
             if not mm:continue
-            known=True
-            minute=int(mm.group(1))
+            known=True; minute=int(mm.group(1))
             if minute<=45:
                 first_half_goal=True
+                ih=ev.get("isHome")
+                if isinstance(ih,bool):
+                    side_known=True
+                    if ih:hth+=1
+                    else:hta+=1
         if known:
             match["iy05"]=1 if first_half_goal else 0
+        if side_known:
+            match["first_half_home"]=hth; match["first_half_away"]=hta; match["first_half_goals"]=hth+hta
     except:pass
 
     match["detail_ok"]=True
@@ -596,7 +601,7 @@ print("profiles.json written")
 
 
 
-# ---------------- V22 PUBLIC TR-MARKET ODDS SNAPSHOTS ----------------
+# ---------------- V25 TRUE-OPENING TR-MARKET ODDS SNAPSHOTS ----------------
 # Public pages expose current Iddaa-style prices. We store the FIRST hourly observation
 # as opening and the latest observation as current. Site prediction percentages are ignored.
 from html.parser import HTMLParser
@@ -705,7 +710,7 @@ def backfill_archive_odds(hist,hmap,target_date,days=120):
     hist_by_date={}
     for fr in hist:
         hist_by_date.setdefault(str(fr.get('date',''))[:10],[]).append(fr)
-    existing_dates=set(str(x.get('date',''))[:10] for x in hmap.values() if x.get('date'))
+    existing_dates=set(str(x.get('date',''))[:10] for x in hmap.values() if x.get('date') and x.get('opening_kind')=='archive_opening')
     wanted=[target_date-datetime.timedelta(days=i) for i in range(1,days+1)]
     missing=[d for d in wanted if d.isoformat() not in existing_dates]
     # First V23 run fills the whole 120-day window; later runs normally fetch only the new missing day(s).
@@ -724,7 +729,7 @@ def backfill_archive_odds(hist,hmap,target_date,days=120):
                     'match_id':fr.get('id') or mid,'home':fr.get('home') or row.get('home'),'away':fr.get('away') or row.get('away'),
                     'league':fr.get('league'),'opening':markets,'current':markets,'opening_kind':'archive_opening',
                     'first_seen':d.isoformat(),'updated_at':d.isoformat(),'date':d.isoformat(),
-                    'hg':fr.get('hg'),'ag':fr.get('ag'),'first_half_goals':fr.get('first_half_goals'),
+                    'hg':fr.get('hg'),'ag':fr.get('ag'),'first_half_goals':fr.get('first_half_goals'),'first_half_home':fr.get('first_half_home'),'first_half_away':fr.get('first_half_away'),
                 }
                 hmap[mid]=rec;added+=1
             print('archive',j,'/',len(missing),d,'rows',len(rows),'matched',added)
@@ -772,20 +777,50 @@ def collect_tr_odds(today_obj,target_date):
             time.sleep(.15)
     return [x for x in collected.values() if x['markets']]
 
+def collect_archive_openings_for_fixtures(today_obj,target_date):
+    """Use the dated bulletin as true/archived opening when the site exposes it; never invent a price."""
+    fixtures=[]
+    for lg in today_obj.get('leagues',[]):
+        for m in lg.get('matches',[]):
+            h=(m.get('home') or {}).get('name');a=(m.get('away') or {}).get('name')
+            if h and a and m.get('id') is not None:fixtures.append({'match_id':m.get('id'),'home':h,'away':a})
+    out={}
+    try: rows=scrape_archive_day(target_date)
+    except Exception as e:
+        print('today archive opening error',e); return out
+    for row in rows:
+        best=None;bestscore=0
+        for fx in fixtures:
+            score=(_sim(row.get('home'),fx['home'])+_sim(row.get('away'),fx['away']))/2
+            if score>bestscore:bestscore=score;best=fx
+        if best and bestscore>=.48:
+            out[str(best['match_id'])]=dict(row.get('markets') or {})
+    print('today archive opening matches',len(out))
+    return out
+
 def update_odds_memory(today_obj,hist,target_date):
     try:old=json.loads(ODDS_TODAY.read_text(encoding='utf-8')) if ODDS_TODAY.exists() else {}
     except:old={}
     oldmap={str(x.get('match_id')):x for x in old.get('matches',[]) if x.get('match_id') is not None}
     fresh=collect_tr_odds(today_obj,target_date)
+    archive_openings=collect_archive_openings_for_fixtures(today_obj,target_date)
     now=datetime.datetime.now(tz).isoformat();rows=[]
     for x in fresh:
         k=str(x['match_id']);prev=oldmap.get(k,{})
-        opening=dict(prev.get('opening') or {})
-        current=dict(prev.get('current') or {})
-        for m,o in x['markets'].items():
-            opening.setdefault(m,o);current[m]=o
-        rows.append({**{z:x.get(z) for z in ('match_id','home','away','league')},'opening':opening,'current':current,'opening_kind':'first_observed_snapshot','first_seen':prev.get('first_seen') or now,'updated_at':now})
-    ODDS_TODAY.write_text(json.dumps({'schema_version':23,'generated_at':now,'market':'TR','source':'public TR iddaa bulletin / odds pages','matches':rows},ensure_ascii=False),encoding='utf-8')
+        archived=dict(archive_openings.get(k) or {})
+        # STRICT separation: opening contains ONLY the dated-bulletin archived opening.
+        # First-observed/current prices are never copied into opening.
+        opening=dict(archived)
+        current=dict(x.get('markets') or {})
+        first_observed=dict(prev.get('first_observed') or {})
+        if not first_observed:
+            first_observed=dict(current)
+        kind='archive_opening' if archived else 'opening_unverified'
+        rows.append({**{z:x.get(z) for z in ('match_id','home','away','league')},
+                     'opening':opening,'current':current,'first_observed':first_observed,
+                     'opening_kind':kind,'opening_verified':bool(archived),
+                     'first_seen':prev.get('first_seen') or now,'updated_at':now})
+    ODDS_TODAY.write_text(json.dumps({'schema_version':25,'generated_at':now,'market':'TR','source':'public TR iddaa bulletin / odds pages','matches':rows},ensure_ascii=False),encoding='utf-8')
 
     # Move finished snapshots into durable pattern history, attaching actual scores.
     try:oh=json.loads(ODDS_HISTORY.read_text(encoding='utf-8')) if ODDS_HISTORY.exists() else {}
@@ -794,29 +829,29 @@ def update_odds_memory(today_obj,hist,target_date):
     finished={str(x.get('id')):x for x in hist if x.get('id') is not None}
     for k,x in oldmap.items():
         fr=finished.get(k)
-        if not fr or not (x.get('opening') or {}):continue
-        rec=dict(x);rec.update({'date':fr.get('date'),'hg':fr.get('hg'),'ag':fr.get('ag'),'first_half_goals':fr.get('first_half_goals')})
+        if not fr or x.get('opening_kind')!='archive_opening' or not (x.get('opening') or {}):continue
+        rec=dict(x);rec.update({'date':fr.get('date'),'hg':fr.get('hg'),'ag':fr.get('ag'),'first_half_goals':fr.get('first_half_goals'),'first_half_home':fr.get('first_half_home'),'first_half_away':fr.get('first_half_away')})
         hmap[k]=rec
     # Historical archive: last 120 days, exact opening odds + actual final scores.
     hmap=backfill_archive_odds(hist,hmap,target_date,120)
     cutoff=(target_date-datetime.timedelta(days=125)).isoformat()
-    vals=[x for x in hmap.values() if str(x.get('date') or x.get('first_seen') or '')[:10]>=cutoff]
+    vals=[x for x in hmap.values() if x.get('opening_kind')=='archive_opening' and str(x.get('date') or x.get('first_seen') or '')[:10]>=cutoff]
     vals.sort(key=lambda x:(str(x.get('date','')),str(x.get('match_id',''))))
-    ODDS_HISTORY.write_text(json.dumps({'schema_version':23,'generated_at':now,'market':'TR','window_days':120,'signature':'EXACT_KG_VAR_PLUS_MS1','matches':vals},ensure_ascii=False),encoding='utf-8')
-    print('TR odds snapshots',len(rows),'exact 120d pattern history',len(vals))
+    ODDS_HISTORY.write_text(json.dumps({'schema_version':25,'generated_at':now,'market':'TR','window_days':120,'signature':'TRUE_OPENING_EXACT_KG_VAR_PLUS_MS1','matches':vals},ensure_ascii=False),encoding='utf-8')
+    print('TR odds snapshots',len(rows),'TRUE-opening exact 120d pattern history',len(vals))
 
 # V22 odds-memory storage. This updater never invents prices.
-# When a TR-market odds collector writes matches here, first observed prices stay opening,
+# When a TR-market odds collector writes matches here, verified archived prices stay opening; first-observed is stored separately,
 # later snapshots become current, and finished rows can be retained in odds_history.json.
 def ensure_odds_store(path,kind):
     if path.exists():
         try:
             obj=json.loads(path.read_text(encoding="utf-8"))
             if isinstance(obj,dict):
-                obj["schema_version"]=23;obj["generated_at"]=datetime.datetime.now(tz).isoformat()
+                obj["schema_version"]=25;obj["generated_at"]=datetime.datetime.now(tz).isoformat()
                 path.write_text(json.dumps(obj,ensure_ascii=False),encoding="utf-8");return
         except:pass
-    path.write_text(json.dumps({"schema_version":23,"generated_at":datetime.datetime.now(tz).isoformat(),"market":"TR","kind":kind,"matches":[]},ensure_ascii=False),encoding="utf-8")
+    path.write_text(json.dumps({"schema_version":25,"generated_at":datetime.datetime.now(tz).isoformat(),"market":"TR","kind":kind,"matches":[]},ensure_ascii=False),encoding="utf-8")
 
 ensure_odds_store(ODDS_TODAY,"opening_current")
 ensure_odds_store(ODDS_HISTORY,"pattern_history")
