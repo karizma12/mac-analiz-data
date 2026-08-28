@@ -8,21 +8,30 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: football-mirror-update
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Fetch and build V22 football context + odds memory
         run: python update_data.py
+
       - name: Commit changes
         run: |
           git config user.name "football-data-bot"
           git config user.email "actions@users.noreply.github.com"
           git add data/*.json
           git diff --cached --quiet || git commit -m "update V22 context and odds memory"
-          git push
+          git pull --rebase origin main
+          git push origin main
